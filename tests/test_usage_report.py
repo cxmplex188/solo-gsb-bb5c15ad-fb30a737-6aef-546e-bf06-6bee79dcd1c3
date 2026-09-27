@@ -227,6 +227,81 @@ def test_consistent_with_simulate_verdicts():
     assert b.rejected_count == total_rejected
 
 
+def test_near_boundary_request_stays_in_own_window():
+    # 回归：t=999999999.5 在右边界 1e9 之前，必须留在窗口 0——旧实现用 EPS
+    # 吸附把它提前归入窗口 1，跨窗补充又把桶推进到未来边界 t=1e9（余额补满
+    # 到 1），导致 r3 被误放行；/simulate 在 t=999999999.5 只补到 0.75，拒绝。
+    buckets = [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}]
+    requests = [
+        {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"]},
+        {"id": "r2", "timestamp": 999999998.5, "cost": 1, "chain": ["A"]},
+        {"id": "r3", "timestamp": 999999999.5, "cost": 1, "chain": ["A"]},
+    ]
+    resp = _run(buckets, requests, window_seconds=1_000_000_000)
+    sim = simulate(
+        SimulateRequest.model_validate({"buckets": buckets, "requests": requests})
+    )
+    assert [r.allowed for r in sim.results] == [True, True, False]
+
+    # 三个请求都在窗口 0 [0, 1e9) 内，不产生第二个窗口
+    assert resp.window_count == 1
+    assert resp.windows[0].model_dump() == {"index": 0, "start": 0.0, "end": 1e9}
+    a = _bucket(resp, "A")
+    assert a.allowed_consumption == 2
+    assert a.rejected_count == 1
+    assert [w.allowed_consumption for w in a.windows] == [2]
+    assert [w.rejected_count for w in a.windows] == [1]
+    # 最低余额 0（r2 在 t=999999998.5 补满后扣到 0）-> 峰值占用 1
+    assert [w.peak_occupancy for w in a.windows] == [1]
+    assert a.peak_window.index == 0
+    assert resp.busiest_window.index == 0
+    assert resp.busiest_window.allowed_count == 2
+    assert resp.busiest_window.rejected_count == 1
+
+
+def test_verdicts_match_simulate_across_near_boundary_sweep():
+    # 回归：围绕窗口右边界的扫掠点上，逐窗归属、放行消耗、拒绝次数与
+    # 逐窗峰值都必须反映与 /simulate 一致的实际回放（补充时钟不越过请求）。
+    # r1/r2 在窗口 0 各消费 1（r2 在 t=1e9-1.5 补满后扣到 0）；r3 落在
+    # 边界前时余额只补到 0.75 以下被拒，落在边界上/后时跨窗补满放行。
+    buckets = [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}]
+    width = 1_000_000_000
+    for offset in (-1, -0.5, 0, 0.5, 1):
+        t3 = width + offset
+        requests = [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"]},
+            {"id": "r2", "timestamp": width - 1.5, "cost": 1, "chain": ["A"]},
+            {"id": "r3", "timestamp": t3, "cost": 1, "chain": ["A"]},
+        ]
+        resp = _run(buckets, requests, window_seconds=width)
+        sim = simulate(
+            SimulateRequest.model_validate({"buckets": buckets, "requests": requests})
+        )
+        verdicts = [r.allowed for r in sim.results]
+        # 边界前拒绝（余额 0.75/0.375 < 1），边界上及之后跨窗补满放行
+        assert verdicts == [True, True, offset >= 0]
+        a = _bucket(resp, "A")
+
+        # 半开归属：t3 < 1e9 时三个请求都在窗口 0；t3 >= 1e9 时 r3 在窗口 1
+        r3_window = 0 if t3 < width else 1
+        assert resp.window_count == r3_window + 1
+        # 窗口 0：r1/r2 放行各计 1，r3 若留在窗口 0 则被拒计 1
+        assert a.windows[0].allowed_consumption == 2
+        assert a.windows[0].rejected_count == (0 if r3_window == 1 else 1)
+        assert a.windows[0].peak_occupancy == 1
+        if r3_window == 1:
+            # 窗口 1：边界补充到 1 后 r3 放行扣到 0 -> 峰值占用 1
+            assert a.windows[1].allowed_consumption == 1
+            assert a.windows[1].rejected_count == 0
+            assert a.windows[1].peak_occupancy == 1
+        # 总计与 /simulate 判定一致
+        assert a.allowed_consumption == sum(verdicts) * 1
+        assert a.rejected_count == verdicts.count(False)
+        assert resp.busiest_window.index == 0
+        assert resp.busiest_window.allowed_count == 2
+        assert resp.busiest_window.rejected_count == (0 if r3_window == 1 else 1)
+
+
 def test_unused_bucket_reports_zero_consumption_and_occupancy():
     resp = _run(
         [

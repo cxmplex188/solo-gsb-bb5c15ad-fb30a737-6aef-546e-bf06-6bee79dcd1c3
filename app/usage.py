@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 from app.models.analysis.usage import (
     BusiestWindow,
@@ -33,9 +34,16 @@ def usage_report(payload: UsageReportRequest) -> UsageReportResponse:
     t_end = max(request.timestamp for request in requests)
     width = float(payload.window_seconds)
 
+    # 半开区间的精确判定基于浮点数的真实实数值（Fraction 按二进制位精确表示
+    # 每个 float），既不靠 EPS 容差——容差会把右边界前紧邻的请求提前归入
+    # 下一窗——也不受浮点除法在整数边界附近舍入的影响。
+    origin = Fraction(t_start)
+    window_width = Fraction(width)
+
     def window_index(timestamp: float) -> int:
-        # 半开区间：边界上的请求属于右侧窗口；EPS 吸附浮点毛刺
-        return int(math.floor((timestamp - t_start) / width + EPS))
+        # 窗口 k 为 [t_start + k*width, t_start + (k+1)*width)：
+        # floor 精确求值，恰好落在边界上的请求属于右侧窗口。
+        return int((Fraction(timestamp) - origin) // window_width)
 
     window_count = window_index(t_end) + 1
 
@@ -81,11 +89,14 @@ def usage_report(payload: UsageReportRequest) -> UsageReportResponse:
         now = request.timestamp
         k = window_index(now)
 
-        # 跨窗：把每个桶连续补充到中间每个窗口边界，记录各窗起点余额
-        # （分段补充与一次性补充结果相同：线性补充、同一容量上限）
+        # 真实跨窗后才逐窗推进：只在请求确实落在更右侧窗口时（半开判定保证
+        # 该窗口的左边界不晚于请求时刻），把每个桶连续补充到中间每个窗口边界，
+        # 记录各窗起点余额。边界按浮点计算可能产生几 ulp 误差，用 min 钳制，
+        # 确保补充时钟绝不越过当前请求（分段补充与一次性补充结果相同：线性
+        # 补充、同一容量上限）。
         while current_window < k:
             current_window += 1
-            boundary = t_start + current_window * width
+            boundary = min(t_start + current_window * width, now)
             for bid in bucket_ids:
                 min_balance[bid][current_window] = refill(bid, boundary)
 
