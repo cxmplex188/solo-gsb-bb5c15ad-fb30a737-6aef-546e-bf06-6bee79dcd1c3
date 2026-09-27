@@ -260,6 +260,64 @@ def test_large_timestamps_windowed_by_elapsed_time():
     assert [w.allowed_consumption for w in a.windows] == [10, 2]
 
 
+def test_wide_window_right_edge_requests_stay_in_own_window():
+    # 回归：宽窗口右边界前的请求不得被提前归入下一窗。
+    # t_start=0、宽度 1e9：t=999999999.5 仍在窗口 0（[0, 1e9)）内，
+    # 旧实现把 EPS 加在窗口序号上，会把它错归到窗口 1。
+    resp = _run(
+        [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"]},
+            {"id": "r2", "timestamp": 999_999_998.5, "cost": 1, "chain": ["A"]},
+            {"id": "r3", "timestamp": 999_999_999.5, "cost": 1, "chain": ["A"]},
+        ],
+        window_seconds=1_000_000_000,
+    )
+    assert resp.window_count == 1
+    assert resp.windows[0].model_dump() == {"index": 0, "start": 0.0, "end": 1_000_000_000.0}
+    a = _bucket(resp, "A")
+    assert [w.allowed_consumption for w in a.windows] == [2]
+    assert [w.rejected_count for w in a.windows] == [1]
+    assert a.allowed_consumption == 2
+    assert a.rejected_count == 1
+
+
+def test_refill_clock_never_jumps_past_current_request():
+    # 回归：跨窗补充不得把桶推进到当前请求之后的（未来）窗口边界。
+    # r3 距上次消费仅 1 秒，只能补 0.75 -> 与 /simulate 一致必须拒绝；
+    # 旧实现先把桶补充到未来边界 t=1e9（补满 1）导致误放行。
+    buckets = [{"id": "A", "capacity": 1, "refill_rate": 0.75, "initial": 1}]
+    requests = [
+        {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"]},
+        {"id": "r2", "timestamp": 999_999_998.5, "cost": 1, "chain": ["A"]},
+        {"id": "r3", "timestamp": 999_999_999.5, "cost": 1, "chain": ["A"]},
+    ]
+    report = _run(buckets, requests, window_seconds=1_000_000_000)
+    sim = simulate(SimulateRequest.model_validate({"buckets": buckets, "requests": requests}))
+    assert [r.allowed for r in sim.results] == [True, True, False]
+    a = _bucket(report, "A")
+    # 放行消耗只含 r1/r2，r3 计入拒绝；峰值占用 = capacity - 最低余额 0
+    assert a.allowed_consumption == 2
+    assert a.rejected_count == 1
+    assert a.peak_occupancy == 1
+    assert a.peak_window.index == 0
+
+
+def test_exact_boundary_still_belongs_to_right_window_at_wide_width():
+    # 宽度 1e9 时恰好落在边界上的请求仍属于右侧窗口（半开区间语义不变）
+    resp = _run(
+        [{"id": "A", "capacity": 10, "refill_rate": 1}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 5, "chain": ["A"]},
+            {"id": "r2", "timestamp": 1_000_000_000, "cost": 5, "chain": ["A"]},
+        ],
+        window_seconds=1_000_000_000,
+    )
+    assert resp.window_count == 2
+    a = _bucket(resp, "A")
+    assert [w.allowed_consumption for w in a.windows] == [5, 5]
+
+
 # ---------- 校验 ----------
 
 def test_window_seconds_must_be_positive():
